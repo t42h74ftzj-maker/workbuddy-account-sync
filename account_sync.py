@@ -19,16 +19,69 @@ Options
   --pin PATH       pin a workspace to top of the list (repeatable)
   --force          skip the "WorkBuddy is running" guard (not recommended)
 
-Workflow when switching accounts
-  1) in current account:  python account_sync.py handoff --title "<task>" --dir "<workspace>"
-                          (let the AI fill the HANDOFF md)
-  2) quit WorkBuddy
-  3) run:                 python account_sync.py sync
-  4) log in with other account, run:  python account_sync.py check   (confirm aligned)
+Two-command workflow when switching accounts (step 1 and 2 are split by quitting
+the app - that boundary cannot be crossed by a single run):
+
+  A) still logged in :  python account_sync.py prepare
+                        -> health check + HANDOFF skeletons for recently active tasks
+                           (AI fills the conclusions: say "fill the HANDOFF files")
+  B) after quitting  :  python account_sync.py sync
+                        -> aligns everything + writes RESUME.md pickup index
+  C) other account   :  python account_sync.py resume
+                        -> prints what to pick up (or just tell the AI "take over")
 """
 import argparse, glob, json, os, shutil, sqlite3, subprocess, sys, time, uuid
 
 PERSONA = ["MEMORY.md", "SOUL.md", "IDENTITY.md", "USER.md"]
+
+HANDOFF_TPL2 = """# HANDOFF - {title}
+
+> exported: {ts} | source account: {acct} | session: {session}
+
+## 0. Auto-filled facts (from local DB)
+- workspace: `{workspace}`
+- status: {status} | last activity: {last}
+- recent output files:
+{files}
+
+## 1. Background & goal
+<one sentence: what is this task solving>
+
+## 2. Done
+- <conclusion 1>
+
+## 3. Key decisions (incl. rejected options)
+| decision | conclusion | why not the alternative |
+|---|---|---|
+
+## 4. Current state
+- done so far: <>
+- next step: <>
+- blocked by: <none>
+
+## 5. Must-read for whoever takes over
+- read first: <>
+- traps to avoid: <>
+"""
+
+
+def recent_files(workspace, hours, limit=10):
+    if not os.path.isdir(workspace):
+        return "  (workspace not found)"
+    cut = time.time() - hours * 3600
+    hits = []
+    for dp, dn, fn in os.walk(workspace):
+        dn[:] = [d for d in dn if d not in (".git", "node_modules", "__pycache__")]
+        for f in fn:
+            fp = os.path.join(dp, f)
+            try:
+                if os.path.getmtime(fp) > cut:
+                    hits.append((os.path.getmtime(fp), os.path.relpath(fp, workspace)))
+            except OSError:
+                pass
+    hits.sort(reverse=True)
+    return "\n".join(f"  - `{p}`" for _, p in hits[:limit]) or "  (none)"
+
 
 HANDOFF_TPL = """# HANDOFF - {title}
 
@@ -224,6 +277,36 @@ class Sync:
                                  (p, "trusted", 0, now, now))
         return len(self.pins)
 
+    def step_resume_index(self):
+        """write .workbuddy/RESUME.md index of newest HANDOFF files into each workspace"""
+        n = 0
+        cwds = [r[0] for r in self.cur.execute("SELECT DISTINCT cwd FROM sessions").fetchall()]
+        for c in cwds:
+            if not c or not os.path.isdir(c):
+                continue
+            d = os.path.join(c, ".workbuddy")
+            if not os.path.isdir(d):
+                continue
+            fs = sorted(glob.glob(os.path.join(d, "HANDOFF-*.md")), key=os.path.getmtime, reverse=True)
+            if not fs:
+                continue
+            n += 1
+            if not self.apply:
+                continue
+            lines = ["# RESUME - pick up here", "",
+                     f"> generated: {time.strftime('%Y-%m-%d %H:%M')} by account_sync", ""]
+            for f in fs[:10]:
+                mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(f)))
+                head = ""
+                for ln in open(f, encoding="utf-8", errors="replace"):
+                    if ln.strip() and not ln.startswith(("#", ">")):
+                        head = ln.strip()[:120]
+                        break
+                lines.append(f"- `{f}` ({mtime}) {head}")
+            lines += ["", "Tell the AI: read the HANDOFF above and continue."]
+            open(os.path.join(d, "RESUME.md"), "w", encoding="utf-8").write("\n".join(lines))
+        return n
+
     def run(self):
         us = self.users()
         print(f"root   : {self.root}")
@@ -240,6 +323,7 @@ class Sync:
         print(f"[3/5] task list clone: {self.step_clone(cols, rows, idx)} missing copies")
         print(f"[4/5] progress align: {self.step_progress(cols, rows, idx)} copies refreshed to newest")
         print(f"[5/5] pinned workspaces: {self.step_pins()}")
+        print(f"[+  ] resume index written into {self.step_resume_index()} workspaces")
         if self.apply:
             self.con.commit()
         self.con.close()
@@ -248,7 +332,9 @@ class Sync:
 
 def main():
     ap = argparse.ArgumentParser(description="WorkBuddy multi-account sync (one machine)")
-    ap.add_argument("cmd", nargs="?", default="check", choices=["check", "sync", "handoff"])
+    ap.add_argument("cmd", nargs="?", default="check",
+                    choices=["check", "sync", "handoff", "prepare", "resume"])
+    ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--root", default=None)
     ap.add_argument("--from", dest="base", default=None)
     ap.add_argument("--pin", action="append", default=[])
@@ -271,6 +357,62 @@ def main():
                                  acct=(a.base or "unknown"), workspace=d)
         open(p, "w", encoding="utf-8").write(txt)
         print(f"wrote {p}")
+        return 0
+
+    if a.cmd == "prepare":
+        # A) still logged in: health check + HANDOFF skeletons for recently active tasks
+        Sync(root, False, a.force, a.base, a.pin).run()
+        s = Sync(root, False, a.force, a.base, a.pin)
+        cut = (time.time() - a.hours * 3600) * 1000
+        rows = s.cur.execute(
+            "SELECT id, cwd, title, updated_at, last_activity_at, status, user_id FROM sessions "
+            "WHERE deleted_at IS NULL AND updated_at > ? ORDER BY updated_at DESC", (cut,)).fetchall()
+        made = []
+        for sid, cwd, title, upd, act, status, uid in rows:
+            if not cwd or not os.path.isdir(cwd):
+                continue
+            t = (title or os.path.basename(cwd)).replace("/", "_").replace("\\", "_")[:60]
+            d = os.path.join(cwd, ".workbuddy")
+            os.makedirs(d, exist_ok=True)
+            p = os.path.join(d, f"HANDOFF-{t}.md")
+            if os.path.exists(p):
+                continue
+            ts = lambda ms: time.strftime("%Y-%m-%d %H:%M", time.localtime((ms or 0) / 1000))
+            open(p, "w", encoding="utf-8").write(HANDOFF_TPL2.format(
+                title=t, ts=time.strftime("%Y-%m-%d %H:%M"), acct=uid[:8], session=sid[:8],
+                workspace=cwd, status=status, last=ts(act or upd),
+                files=recent_files(cwd, a.hours)))
+            made.append(p)
+        print(f"\n[prepare] {len(made)} HANDOFF skeleton(s) created (active in last {a.hours}h):")
+        for p in made[:20]:
+            print(f"   {p}")
+        if made:
+            print("\nnext: tell the AI \"fill these HANDOFF files\", then quit WorkBuddy and run: sync")
+        return 0
+
+    if a.cmd == "resume":
+        # C) other account: what to pick up
+        cwds = [a.dir] if a.dir else []
+        if not cwds:
+            try:
+                s = Sync(root, False, True, None, [])
+                cwds = [r[0] for r in s.cur.execute("SELECT DISTINCT cwd FROM sessions").fetchall()]
+            except SystemExit:
+                cwds = [os.getcwd()]
+        found = []
+        for c in cwds:
+            if not c or not os.path.isdir(c):
+                continue
+            found += sorted(glob.glob(os.path.join(c, ".workbuddy", "HANDOFF-*.md")),
+                            key=os.path.getmtime, reverse=True)
+        if not found:
+            print("no HANDOFF found. run `prepare` in the previous account before quitting.")
+            return 0
+        print(f"[resume] {len(found)} HANDOFF file(s), newest first:")
+        for f in found[:15]:
+            print(f"   {time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(f)))}  {f}")
+        newest = found[0]
+        print(f"\nTell the AI: read `{newest}` and continue from there.")
         return 0
 
     apply_ = (a.cmd == "sync")

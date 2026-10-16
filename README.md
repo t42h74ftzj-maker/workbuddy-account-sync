@@ -22,20 +22,21 @@ WorkBuddy 把账号相关的数据分成三层，只有中间那层能在本机�
 
 ## Usage / 用法
 
-### 换账号的标准流程
+### 换账号：两条命令（中间必须退出应用）
 
 ```bash
-# 1) 当前账号内：把对话结论导成 HANDOFF（让 AI 按模板填）
-python account_sync.py handoff --title "任务名" --dir "<工作空间>"
+# A) 还在当前账号内 —— 一条命令：体检 + 批量生成 HANDOFF 骨架（元数据自动填好）
+python account_sync.py prepare --hours 24
+# 然后对 AI 说：填写这些 HANDOFF 文件（AI 补结论/决策/下一步）
 
-# 2) 完全退出 WorkBuddy（含托盘图标）
-
-# 3) 对齐
+# B) 退出 WorkBuddy 后 —— 一条命令：全部对齐 + 写 RESUME.md 接班索引
 python account_sync.py sync
 
-# 4) 登录另一个账号，读 HANDOFF 接班；可再跑一次确认
-python account_sync.py check
+# C) 登录另一个账号 —— 一条命令：告诉你读哪个 HANDOFF 接班
+python account_sync.py resume
 ```
+
+第 A 步必须在账号内（AI 要读上下文才能写结论），第 B 步必须在退出后（要写数据库）。中间隔着重启应用，任何脚本都跨不过去 —— 所以物理下限是 **2 条命令 + 1 句 AI 指令**。
 
 ### 命令
 
@@ -43,7 +44,9 @@ python account_sync.py check
 |---|---|---|
 | `check` | 只读体检：账号数 / 任务数 / 缺失副本 / 进度差异 | 否 |
 | `sync` | 写库对齐（先自动备份 `workbuddy.db`） | **是**，未退出直接拒绝 |
-| `handoff` | 生成 HANDOFF 模板 | 否 |
+| `prepare` | 体检 + 批量生成 HANDOFF 骨架（元数据自动填） | 否 |
+| `resume` | 列出可接手的 HANDOFF，指出读哪个 | 否 |
+| `handoff` | 单独生成一份 HANDOFF 模板 | 否 |
 
 参数：`--root <数据目录>`（默认自动探测 `$WORKBUDDY_CONFIG_DIR` 或 `~/.workbuddy`）、`--from <账号前缀>`、`--pin <工作空间>`（置顶，可重复）、`--force`（跳过进程检查）。
 
