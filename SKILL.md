@@ -61,7 +61,7 @@ description: 同一台机器上多个 WorkBuddy 账号之间对齐全部内容�
 ## 装到别的机器
 
 ```
-git clone https://github.com/<owner>/workbuddy-account-sync
+git clone https://github.com/t42h74ftzj-maker/workbuddy-account-sync
 cp -r workbuddy-account-sync ~/.workbuddy/skills/workbuddy-account-sync   # 用户级技能目录
 python ~/.workbuddy/skills/workbuddy-account-sync/account_sync.py check
 ```
